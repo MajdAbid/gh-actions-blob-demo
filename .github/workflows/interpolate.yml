@@ -9,6 +9,8 @@ jobs:
   process:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+    env:
+      R_LIBS_USER: /home/runner/R/library
 
     steps:
       - uses: actions/checkout@v4
@@ -35,7 +37,8 @@ jobs:
       - name: Install R packages
         if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
         run: |
-          Rscript -e "install.packages(c('terra','sf','dplyr'), repos='https://cloud.r-project.org', quiet=TRUE)"
+          mkdir -p $R_LIBS_USER
+          Rscript -e "install.packages(c('terra','sf','dplyr'), lib='$R_LIBS_USER', repos='https://cloud.r-project.org', quiet=FALSE)"
 
       - name: Download raw data
         if: steps.check.outputs.rasters_done == 'false'
@@ -73,8 +76,7 @@ jobs:
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
             "process-data/built_by_adm2"
 
-            
-      - name: Delete boundaries        # <-- add this
+      - name: Delete boundaries
         if: steps.check.outputs.csv_done == 'false'
         run: rm -rf raw-data/boundaries
 
