@@ -1,0 +1,115 @@
+name: Built-S Interpolation Pipeline
+
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            process-data/interpolated-rasters
+            process-data/built_by_adm2
+          key: built-s-outputs-2020-2025-v1
+
+      - name: Check what needs doing
+        id: check
+        run: bash scripts/check.sh
+
+      - name: Install system dependencies
+        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev libgeos-dev libproj-dev libudunits2-dev r-base
+
+      - name: Install R packages
+        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
+        run: |
+          Rscript -e "install.packages(c('terra','sf','dplyr'), repos='https://cloud.r-project.org', quiet=TRUE)"
+
+      - name: Download raw data
+        if: steps.check.outputs.rasters_done == 'false'
+        run: bash scripts/download.sh
+
+      - name: Find TIF paths
+        if: steps.check.outputs.rasters_done == 'false'
+        id: tifs
+        run: |
+          TIF_2020=$(find raw-data/built_2020 -name "*.tif" | head -1)
+          TIF_2025=$(find raw-data/built_2025 -name "*.tif" | head -1)
+          echo "tif_2020=$TIF_2020" >> $GITHUB_OUTPUT
+          echo "tif_2025=$TIF_2025" >> $GITHUB_OUTPUT
+          echo "Found: $TIF_2020 and $TIF_2025"
+
+      - name: Interpolate rasters
+        if: steps.check.outputs.rasters_done == 'false'
+        run: |
+          Rscript scripts/01_interpolate.R \
+            "${{ steps.tifs.outputs.tif_2020 }}" \
+            "${{ steps.tifs.outputs.tif_2025 }}" \
+            "process-data/interpolated-rasters"
+
+      - name: Delete raw downloads
+        if: steps.check.outputs.rasters_done == 'false'
+        run: |
+          rm -rf raw-data/built_2020 raw-data/built_2025
+          echo "Raw rasters deleted. Disk free: $(df -h . | tail -1 | awk '{print $4}')"
+
+      - name: Extract by ADM2
+        if: steps.check.outputs.csv_done == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2"
+
+            
+      - name: Delete boundaries        # <-- add this
+        if: steps.check.outputs.csv_done == 'false'
+        run: rm -rf raw-data/boundaries
+
+      - name: Upload rasters artifact
+        if: steps.check.outputs.rasters_done == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: interpolated-rasters-${{ github.run_id }}
+          path: process-data/interpolated-rasters/
+          retention-days: 30
+
+      - name: Upload CSVs artifact
+        if: steps.check.outputs.csv_done == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-adm2-csvs-${{ github.run_id }}
+          path: process-data/built_by_adm2/
+          retention-days: 30
+
+      - name: Save cache
+        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            process-data/interpolated-rasters
+            process-data/built_by_adm2
+          key: built-s-outputs-2020-2025-v1
+
+      - name: Summary
+        run: |
+          echo "### Pipeline Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Year | Raster | CSV |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          for yr in 2020 2021 2022 2023 2024 2025; do
+            R=$([ -f "process-data/interpolated-rasters/built_${yr}.tif" ] && echo "✅" || echo "❌")
+            C=$([ -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅" || echo "❌")
+            echo "| $yr | $R | $C |" >> $GITHUB_STEP_SUMMARY
+          done
