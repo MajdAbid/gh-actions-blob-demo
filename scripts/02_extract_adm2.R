@@ -9,13 +9,14 @@ suppressPackageStartupMessages({
 })
 
 args <- commandArgs(trailingOnly = TRUE)
-if (length(args) != 3) {
-  stop("Usage: Rscript 02_extract_adm2.R <raster_dir> <geojson_path> <out_dir>")
+if (length(args) < 3 || length(args) > 4) {
+  stop("Usage: Rscript 02_extract_adm2.R <raster_dir> <geojson_path> <out_dir> [year]")
 }
 
 raster_dir  <- args[1]
 geojson     <- args[2]
 out_dir     <- args[3]
+target_year <- if (length(args) == 4) as.integer(args[4]) else NULL
 
 #-------------------------------------------------------------------------------
 message("Reading ADM2 boundaries...")
@@ -64,8 +65,9 @@ extract_year <- function(year) {
 }
 
 #-------------------------------------------------------------------------------
-for (year in 2020:2025) {
+years_to_process <- if (!is.null(target_year)) target_year else 2020:2025
+for (year in years_to_process) {
   extract_year(year)
 }
 
-message("\nAll years complete.")
+message("\nDone: ", paste(years_to_process, collapse = ", "))

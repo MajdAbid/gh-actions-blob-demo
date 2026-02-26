@@ -1,23 +1,22 @@
 #!/usr/bin/env bash
-# Checks which years are missing outputs, sets flags for the workflow
+# Inspects the repo checkout to decide what still needs to be done.
 
 set -euo pipefail
 
-RASTERS_DONE=true # Assumes it's done at first
-CSV_DONE=true # Assumes it's done at first
+CSV_DONE=true
+REMAINING_YEARS=()
 
 for yr in 2020 2021 2022 2023 2024 2025; do
-  if [ ! -f "process-data/interpolated-rasters/built_${yr}.tif" ]; then
-    echo "Missing raster: built_${yr}.tif"
-    RASTERS_DONE=false
-  fi
-    if [ ! -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ]; then
-    echo "Missing CSV: built_${yr}_by_adm2.csv"
+  if [ ! -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ]; then
     CSV_DONE=false
+    REMAINING_YEARS+=("$yr")
+    echo "csv_done_${yr}=false" >> "${GITHUB_OUTPUT:-/dev/stdout}"
+  else
+    echo "csv_done_${yr}=true" >> "${GITHUB_OUTPUT:-/dev/stdout}"
   fi
 done
 
-echo "rasters_done=$RASTERS_DONE" >> "${GITHUB_OUTPUT:-/dev/stdout}"
-echo "csv_done=$CSV_DONE"         >> "${GITHUB_OUTPUT:-/dev/stdout}"
+echo "csv_done=$CSV_DONE" >> "${GITHUB_OUTPUT:-/dev/stdout}"
+echo "remaining_count=${#REMAINING_YEARS[@]}" >> "${GITHUB_OUTPUT:-/dev/stdout}"
 
-echo "Check complete — rasters_done=$RASTERS_DONE csv_done=$CSV_DONE"
+echo "Check complete — csv_done=$CSV_DONE remaining=${REMAINING_YEARS[*]:-none}"

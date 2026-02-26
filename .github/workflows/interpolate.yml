@@ -5,48 +5,127 @@ on:
     - cron: '0 6 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: write  # push CSVs to repo
+  actions: read    # download artifacts from other runs
+
 jobs:
   process:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 350
     env:
       R_LIBS_USER: /home/runner/R/library
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Restore cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            process-data/interpolated-rasters
-            process-data/built_by_adm2
-          key: built-s-outputs-2020-2025-v1
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Create output directories
+        run: mkdir -p process-data/interpolated-rasters process-data/built_by_adm2
+
+      # Source of truth: whatever is committed in the repo right now
       - name: Check what needs doing
         id: check
         run: bash scripts/check.sh
 
+      - name: Progress — starting state
+        run: |
+          echo "## Built-S Pipeline" >> $GITHUB_STEP_SUMMARY
+          echo "**Years remaining:** ${{ steps.check.outputs.remaining_count }} / 6" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Year | CSV in repo |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          for yr in 2020 2021 2022 2023 2024 2025; do
+            C=$([ -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅ committed" || echo "⏳ pending")
+            echo "| $yr | $C |" >> $GITHUB_STEP_SUMMARY
+          done
+
+      # ── Environment setup ─────────────────────────────────────────────────────
+
+      - name: Restore R library cache
+        id: r-cache
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/R/library
+          key: r-libs-${{ runner.os }}-terra-sf-dplyr-v1
+
       - name: Install system dependencies
-        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
+        if: steps.check.outputs.csv_done == 'false'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y --no-install-recommends \
             libgdal-dev libgeos-dev libproj-dev libudunits2-dev r-base
 
       - name: Install R packages
-        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
+        if: |
+          steps.r-cache.outputs.cache-hit != 'true' &&
+          steps.check.outputs.csv_done == 'false'
         run: |
           mkdir -p $R_LIBS_USER
           Rscript -e "install.packages(c('terra','sf','dplyr'), lib='$R_LIBS_USER', repos='https://cloud.r-project.org', quiet=FALSE)"
 
+      - name: Save R library cache
+        if: steps.r-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: /home/runner/R/library
+          key: r-libs-${{ runner.os }}-terra-sf-dplyr-v1
+
+      # ── Raster acquisition ────────────────────────────────────────────────────
+      # Rasters are never committed to the repo — they live as an artifact
+      # produced once and reused across runs until all CSVs are committed.
+
+      - name: Find rasters artifact from a previous run
+        id: find-rasters
+        if: steps.check.outputs.csv_done == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          INFO=$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=interpolated-rasters-stable&per_page=10" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last // empty')
+          if [ -n "$INFO" ] && [ "$INFO" != "null" ]; then
+            RUN_ID=$(echo "$INFO" | jq -r '.workflow_run.id')
+            echo "found=true"  >> $GITHUB_OUTPUT
+            echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+            echo "Rasters artifact found in run $RUN_ID"
+          else
+            echo "found=false" >> $GITHUB_OUTPUT
+            echo "No existing rasters artifact — will download raw data and interpolate"
+          fi
+
+      - name: Download rasters artifact
+        id: dl-rasters
+        if: steps.check.outputs.csv_done == 'false' && steps.find-rasters.outputs.found == 'true'
+        continue-on-error: true  # fall through to re-interpolate if download fails
+        uses: actions/download-artifact@v4
+        with:
+          name: interpolated-rasters-stable
+          path: process-data/interpolated-rasters
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id: ${{ steps.find-rasters.outputs.run_id }}
+
+      - name: Check rasters on disk
+        id: rasters
+        if: steps.check.outputs.csv_done == 'false'
+        run: |
+          COUNT=$(find process-data/interpolated-rasters -name "*.tif" 2>/dev/null | wc -l)
+          echo "ready=$([ "$COUNT" -ge 6 ] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "TIF count on disk: $COUNT"
+
+      # ── Fresh interpolation (only when artifact unavailable or expired) ────────
+
       - name: Download raw data
-        if: steps.check.outputs.rasters_done == 'false'
+        if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
         run: bash scripts/download.sh
 
       - name: Find TIF paths
-        if: steps.check.outputs.rasters_done == 'false'
         id: tifs
+        if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
         run: |
           TIF_2020=$(find raw-data/built_2020 -name "*.tif" | head -1)
           TIF_2025=$(find raw-data/built_2025 -name "*.tif" | head -1)
@@ -55,63 +134,156 @@ jobs:
           echo "Found: $TIF_2020 and $TIF_2025"
 
       - name: Interpolate rasters
-        if: steps.check.outputs.rasters_done == 'false'
+        if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
         run: |
           Rscript scripts/01_interpolate.R \
             "${{ steps.tifs.outputs.tif_2020 }}" \
             "${{ steps.tifs.outputs.tif_2025 }}" \
             "process-data/interpolated-rasters"
 
-      - name: Delete raw downloads
-        if: steps.check.outputs.rasters_done == 'false'
+      # Keep the artifact alive for as long as the pipeline may span
+      - name: Upload rasters artifact
+        if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: interpolated-rasters-stable
+          path: process-data/interpolated-rasters/
+          retention-days: 90
+
+      - name: Delete raw raster downloads
+        if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
         run: |
           rm -rf raw-data/built_2020 raw-data/built_2025
-          echo "Raw rasters deleted. Disk free: $(df -h . | tail -1 | awk '{print $4}')"
+          echo "Freed: $(df -h . | tail -1 | awk '{print $4}') remaining"
 
-      - name: Extract by ADM2
+      # ── Boundaries ────────────────────────────────────────────────────────────
+      # Always needed for extraction. download.sh already fetches them on a fresh
+      # run. On resume runs (artifact path), they are re-downloaded here.
+
+      - name: Ensure boundaries present
         if: steps.check.outputs.csv_done == 'false'
+        run: |
+          if [ ! -f "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" ]; then
+            mkdir -p raw-data/boundaries
+            echo "[download] ADM2 boundaries..."
+            curl -fsSL --retry 3 --retry-delay 10 --progress-bar -L \
+              -o "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+              "https://github.com/wmgeolab/geoBoundaries/raw/main/releaseData/CGAZ/geoBoundariesCGAZ_ADM2.geojson"
+          fi
+
+      # ── Per-year extraction — each CSV committed to the repo the moment it's ready
+
+      - name: Extract ADM2 — 2020
+        if: steps.check.outputs.csv_done_2020 == 'false'
         run: |
           Rscript scripts/02_extract_adm2.R \
             "process-data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2"
+            "process-data/built_by_adm2" 2020
+
+      - name: Commit CSV — 2020
+        if: steps.check.outputs.csv_done_2020 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2020_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2020"
+          git push
+
+      - name: Extract ADM2 — 2021
+        if: steps.check.outputs.csv_done_2021 == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2" 2021
+
+      - name: Commit CSV — 2021
+        if: steps.check.outputs.csv_done_2021 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2021_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2021"
+          git push
+
+      - name: Extract ADM2 — 2022
+        if: steps.check.outputs.csv_done_2022 == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2" 2022
+
+      - name: Commit CSV — 2022
+        if: steps.check.outputs.csv_done_2022 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2022_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2022"
+          git push
+
+      - name: Extract ADM2 — 2023
+        if: steps.check.outputs.csv_done_2023 == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2" 2023
+
+      - name: Commit CSV — 2023
+        if: steps.check.outputs.csv_done_2023 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2023_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2023"
+          git push
+
+      - name: Extract ADM2 — 2024
+        if: steps.check.outputs.csv_done_2024 == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2" 2024
+
+      - name: Commit CSV — 2024
+        if: steps.check.outputs.csv_done_2024 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2024_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2024"
+          git push
+
+      - name: Extract ADM2 — 2025
+        if: steps.check.outputs.csv_done_2025 == 'false'
+        run: |
+          Rscript scripts/02_extract_adm2.R \
+            "process-data/interpolated-rasters" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "process-data/built_by_adm2" 2025
+
+      - name: Commit CSV — 2025
+        if: steps.check.outputs.csv_done_2025 == 'false'
+        run: |
+          git add process-data/built_by_adm2/built_2025_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for 2025"
+          git push
+
+      # ── Cleanup & summary ─────────────────────────────────────────────────────
 
       - name: Delete boundaries
         if: steps.check.outputs.csv_done == 'false'
         run: rm -rf raw-data/boundaries
 
-      - name: Upload rasters artifact
-        if: steps.check.outputs.rasters_done == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: interpolated-rasters-${{ github.run_id }}
-          path: process-data/interpolated-rasters/
-          retention-days: 30
-
-      - name: Upload CSVs artifact
-        if: steps.check.outputs.csv_done == 'false'
-        uses: actions/upload-artifact@v4
-        with:
-          name: built-adm2-csvs-${{ github.run_id }}
-          path: process-data/built_by_adm2/
-          retention-days: 30
-
-      - name: Save cache
-        if: steps.check.outputs.rasters_done == 'false' || steps.check.outputs.csv_done == 'false'
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            process-data/interpolated-rasters
-            process-data/built_by_adm2
-          key: built-s-outputs-2020-2025-v1
-
       - name: Summary
         run: |
-          echo "### Pipeline Status" >> $GITHUB_STEP_SUMMARY
-          echo "| Year | Raster | CSV |" >> $GITHUB_STEP_SUMMARY
-          echo "|------|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Final Status" >> $GITHUB_STEP_SUMMARY
+          echo "| Year | CSV in repo |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
+          REMAINING=0
           for yr in 2020 2021 2022 2023 2024 2025; do
-            R=$([ -f "process-data/interpolated-rasters/built_${yr}.tif" ] && echo "✅" || echo "❌")
             C=$([ -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅" || echo "❌")
-            echo "| $yr | $R | $C |" >> $GITHUB_STEP_SUMMARY
+            echo "| $yr | $C |" >> $GITHUB_STEP_SUMMARY
+            [ "$C" = "❌" ] && REMAINING=$((REMAINING + 1))
           done
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ "$REMAINING" -eq 0 ]; then
+            echo "All 6 years committed to the repository." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**$REMAINING year(s) still pending** — will resume automatically on next scheduled run." >> $GITHUB_STEP_SUMMARY
+          fi
