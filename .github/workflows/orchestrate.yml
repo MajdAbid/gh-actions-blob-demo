@@ -45,7 +45,7 @@ jobs:
 
             MISSING=$(bash scripts/check_csvs.sh "$START" "$END")
             if [ -n "$MISSING" ]; then
-              PAIRS=$(echo "$PAIRS" | jq \
+              PAIRS=$(echo "$PAIRS" | jq -c \
                 --argjson s "$START" --argjson e "$END" \
                 '. + [{"year_start": $s, "year_end": $e}]')
               echo "  Pair ($START, $END): missing years → $MISSING"
