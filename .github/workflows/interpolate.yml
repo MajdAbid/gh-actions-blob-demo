@@ -25,12 +25,12 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Create output directories
-        run: mkdir -p process-data/interpolated-rasters process-data/built_by_adm2
+        run: mkdir -p data/interpolated-rasters data/pop_data_by_adm2
 
       # Source of truth: whatever is committed in the repo right now
       - name: Check what needs doing
         id: check
-        run: bash scripts/check.sh
+        run: bash code/data_prep/check.sh
 
       - name: Progress — starting state
         run: |
@@ -40,7 +40,7 @@ jobs:
           echo "| Year | CSV in repo |" >> $GITHUB_STEP_SUMMARY
           echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
           for yr in 2020 2021 2022 2023 2024 2025; do
-            C=$([ -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅ committed" || echo "⏳ pending")
+            C=$([ -f "data/pop_data_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅ committed" || echo "⏳ pending")
             echo "| $yr | $C |" >> $GITHUB_STEP_SUMMARY
           done
 
@@ -105,7 +105,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: interpolated-rasters-stable
-          path: process-data/interpolated-rasters
+          path: data/interpolated-rasters
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ steps.find-rasters.outputs.run_id }}
 
@@ -113,7 +113,7 @@ jobs:
         id: rasters
         if: steps.check.outputs.csv_done == 'false'
         run: |
-          COUNT=$(find process-data/interpolated-rasters -name "*.tif" 2>/dev/null | wc -l)
+          COUNT=$(find data/interpolated-rasters -name "*.tif" 2>/dev/null | wc -l)
           echo "ready=$([ "$COUNT" -ge 6 ] && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "TIF count on disk: $COUNT"
 
@@ -121,7 +121,7 @@ jobs:
 
       - name: Download raw data
         if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
-        run: bash scripts/download.sh
+        run: bash code/data_prep/download.sh
 
       - name: Find TIF paths
         id: tifs
@@ -136,10 +136,10 @@ jobs:
       - name: Interpolate rasters
         if: steps.check.outputs.csv_done == 'false' && steps.rasters.outputs.ready == 'false'
         run: |
-          Rscript scripts/01_interpolate.R \
+          Rscript code/data_prep/01_interpolate.R \
             "${{ steps.tifs.outputs.tif_2020 }}" \
             "${{ steps.tifs.outputs.tif_2025 }}" \
-            "process-data/interpolated-rasters"
+            "data/interpolated-rasters"
 
       # Keep the artifact alive for as long as the pipeline may span
       - name: Upload rasters artifact
@@ -147,7 +147,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: interpolated-rasters-stable
-          path: process-data/interpolated-rasters/
+          path: data/interpolated-rasters/
           retention-days: 90
 
       - name: Delete raw raster downloads
@@ -176,90 +176,90 @@ jobs:
       - name: Extract ADM2 — 2020
         if: steps.check.outputs.csv_done_2020 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2020
+            "data/pop_data_by_adm2" 2020
 
       - name: Commit CSV — 2020
         if: steps.check.outputs.csv_done_2020 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2020_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2020_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2020"
           git push
 
       - name: Extract ADM2 — 2021
         if: steps.check.outputs.csv_done_2021 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2021
+            "data/pop_data_by_adm2" 2021
 
       - name: Commit CSV — 2021
         if: steps.check.outputs.csv_done_2021 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2021_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2021_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2021"
           git push
 
       - name: Extract ADM2 — 2022
         if: steps.check.outputs.csv_done_2022 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2022
+            "data/pop_data_by_adm2" 2022
 
       - name: Commit CSV — 2022
         if: steps.check.outputs.csv_done_2022 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2022_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2022_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2022"
           git push
 
       - name: Extract ADM2 — 2023
         if: steps.check.outputs.csv_done_2023 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2023
+            "data/pop_data_by_adm2" 2023
 
       - name: Commit CSV — 2023
         if: steps.check.outputs.csv_done_2023 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2023_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2023_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2023"
           git push
 
       - name: Extract ADM2 — 2024
         if: steps.check.outputs.csv_done_2024 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2024
+            "data/pop_data_by_adm2" 2024
 
       - name: Commit CSV — 2024
         if: steps.check.outputs.csv_done_2024 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2024_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2024_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2024"
           git push
 
       - name: Extract ADM2 — 2025
         if: steps.check.outputs.csv_done_2025 == 'false'
         run: |
-          Rscript scripts/02_extract_adm2.R \
-            "process-data/interpolated-rasters" \
+          Rscript code/data_prep/02_extract_adm2.R \
+            "data/interpolated-rasters" \
             "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
-            "process-data/built_by_adm2" 2025
+            "data/pop_data_by_adm2" 2025
 
       - name: Commit CSV — 2025
         if: steps.check.outputs.csv_done_2025 == 'false'
         run: |
-          git add process-data/built_by_adm2/built_2025_by_adm2.csv
+          git add data/pop_data_by_adm2/built_2025_by_adm2.csv
           git commit -m "data: add built_by_adm2 for 2025"
           git push
 
@@ -277,7 +277,7 @@ jobs:
           echo "|------|-------------|" >> $GITHUB_STEP_SUMMARY
           REMAINING=0
           for yr in 2020 2021 2022 2023 2024 2025; do
-            C=$([ -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅" || echo "❌")
+            C=$([ -f "data/pop_data_by_adm2/built_${yr}_by_adm2.csv" ] && echo "✅" || echo "❌")
             echo "| $yr | $C |" >> $GITHUB_STEP_SUMMARY
             [ "$C" = "❌" ] && REMAINING=$((REMAINING + 1))
           done

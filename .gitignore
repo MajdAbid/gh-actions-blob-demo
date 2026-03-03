@@ -1,0 +1,6 @@
+raw-data/
+data/interpolated-rasters/
+*.zip
+.Rhistory
+.RData
+.Rproj.user/

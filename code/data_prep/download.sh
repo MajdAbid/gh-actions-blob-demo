@@ -11,8 +11,8 @@ GEOBOUNDARIES_URL="https://github.com/wmgeolab/geoBoundaries/raw/main/releaseDat
 mkdir -p raw-data/built_2020 \
          raw-data/built_2025 \
          raw-data/boundaries \
-         process-data/interpolated-rasters \
-         process-data/built_by_adm2
+         data/interpolated-rasters \
+         data/pop_data_by_adm2
 
 #-------------------------------------------------------------------------------
 download_built() {

@@ -7,7 +7,7 @@ CSV_DONE=true
 REMAINING_YEARS=()
 
 for yr in 2020 2021 2022 2023 2024 2025; do
-  if [ ! -f "process-data/built_by_adm2/built_${yr}_by_adm2.csv" ]; then
+  if [ ! -f "data/pop_data_by_adm2/built_${yr}_by_adm2.csv" ]; then
     CSV_DONE=false
     REMAINING_YEARS+=("$yr")
     echo "csv_done_${yr}=false" >> "${GITHUB_OUTPUT:-/dev/stdout}"
