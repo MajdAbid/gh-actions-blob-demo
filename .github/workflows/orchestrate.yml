@@ -1,0 +1,73 @@
+name: GHS Built-S Pipeline — Orchestrator
+
+# Outer loop. For each anchor pair (in reverse chronological order), checks
+# whether any CSVs are missing and, if so, dispatches process-pair.yml.
+#
+# Anchor years: 1975 1980 1985 1990 1995 2000 2005 2010 2015 2020 2025
+# Pairs (most-recent first):
+#   (2020,2025) (2015,2020) (2010,2015) (2005,2010) (2000,2005)
+#   (1995,2000) (1990,1995) (1985,1990) (1980,1985) (1975,1980)
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'   # every Monday 06:00 UTC
+  workflow_dispatch:
+
+# Prevent concurrent orchestrator runs from racing on repo state.
+concurrency:
+  group: ghs-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  # ── Plan: determine which pairs still have missing CSVs ─────────────────────
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      pairs: ${{ steps.compute.outputs.pairs }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute pairs with missing CSVs
+        id: compute
+        run: |
+          PAIRS='[]'
+          for PAIR in \
+              "2020 2025" "2015 2020" "2010 2015" "2005 2010" "2000 2005" \
+              "1995 2000" "1990 1995" "1985 1990" "1980 1985" "1975 1980"; do
+
+            START=$(echo "$PAIR" | awk '{print $1}')
+            END=$(echo "$PAIR"   | awk '{print $2}')
+
+            MISSING=$(bash scripts/check_csvs.sh "$START" "$END")
+            if [ -n "$MISSING" ]; then
+              PAIRS=$(echo "$PAIRS" | jq \
+                --argjson s "$START" --argjson e "$END" \
+                '. + [{"year_start": $s, "year_end": $e}]')
+              echo "  Pair ($START, $END): missing years → $MISSING"
+            else
+              echo "  Pair ($START, $END): all CSVs committed — skip"
+            fi
+          done
+
+          echo "pairs=$PAIRS" >> "$GITHUB_OUTPUT"
+          echo "Pairs dispatching: $PAIRS"
+
+  # ── Process: one matrix slot per pair that has work remaining ───────────────
+  process:
+    needs: plan
+    if: needs.plan.outputs.pairs != '[]'
+    strategy:
+      matrix:
+        pair: ${{ fromJSON(needs.plan.outputs.pairs) }}
+      fail-fast: false
+      max-parallel: 1          # sequential — pairs share anchor years in raw artifacts
+    uses: ./.github/workflows/process-pair.yml
+    with:
+      year_start: ${{ matrix.pair.year_start }}
+      year_end:   ${{ matrix.pair.year_end }}
+    secrets: inherit

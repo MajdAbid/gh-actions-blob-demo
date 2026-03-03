@@ -1,0 +1,428 @@
+name: GHS Built-S Pipeline — Process Pair
+
+# Reusable inner worker. Called by orchestrate.yml with a (year_start, year_end) pair.
+#
+# Decision tree (lazy evaluation):
+#   1. Check which CSVs in [year_start, year_end] are missing from the repo.
+#   2. Check which of those years lack a valid raster artifact.
+#   3. If any rasters are missing: acquire both anchor raw TIFs (artifact or JRC FTP),
+#      interpolate the missing years, upload each as an artifact.
+#   4. Download raster artifacts for years that have them but still need CSVs.
+#   5. Extract ADM2 stats and commit each CSV immediately after extraction.
+
+on:
+  workflow_call:
+    inputs:
+      year_start:
+        type: number
+        required: true
+      year_end:
+        type: number
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    env:
+      R_LIBS_USER: /home/runner/R/library
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure git
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ── Pre-compute the 6 individual year values (year_start through year_end) ──
+      # These are referenced as steps.years.outputs.y0 … y5 throughout.
+      - name: Compute pair years
+        id: years
+        run: |
+          S=${{ inputs.year_start }}
+          echo "y0=$S"                        >> "$GITHUB_OUTPUT"
+          echo "y1=$((S + 1))"               >> "$GITHUB_OUTPUT"
+          echo "y2=$((S + 2))"               >> "$GITHUB_OUTPUT"
+          echo "y3=$((S + 3))"               >> "$GITHUB_OUTPUT"
+          echo "y4=$((S + 4))"               >> "$GITHUB_OUTPUT"
+          echo "y5=${{ inputs.year_end }}"   >> "$GITHUB_OUTPUT"
+
+      # ── Step 1: which CSVs are missing? ────────────────────────────────────────
+      - name: Check missing CSVs
+        id: check-csvs
+        run: |
+          MISSING=$(bash scripts/check_csvs.sh \
+            ${{ inputs.year_start }} ${{ inputs.year_end }})
+          echo "missing=$MISSING"                                          >> "$GITHUB_OUTPUT"
+          echo "has_missing=$([ -n "$MISSING" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          echo "Missing CSV years: ${MISSING:-none}"
+
+      # ── Step 2: which of those years lack a valid raster artifact? ─────────────
+      - name: Check missing raster artifacts
+        id: check-rasters
+        if: steps.check-csvs.outputs.has_missing == 'true'
+        run: |
+          MISSING=$(bash scripts/check_artifacts.sh \
+            interpolated-rasters ${{ steps.check-csvs.outputs.missing }})
+          echo "missing=$MISSING"                                               >> "$GITHUB_OUTPUT"
+          echo "needs_interp=$([ -n "$MISSING" ] && echo true || echo false)"  >> "$GITHUB_OUTPUT"
+          echo "Missing raster artifact years: ${MISSING:-none}"
+
+      # ── R environment (only when there is extraction work to do) ───────────────
+      - name: Restore R library cache
+        id: r-cache
+        if: steps.check-csvs.outputs.has_missing == 'true'
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/R/library
+          key: r-libs-${{ runner.os }}-terra-sf-dplyr-v1
+
+      - name: Install system dependencies
+        if: steps.check-csvs.outputs.has_missing == 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev libgeos-dev libproj-dev libudunits2-dev r-base
+
+      - name: Install R packages
+        if: |
+          steps.r-cache.outputs.cache-hit != 'true' &&
+          steps.check-csvs.outputs.has_missing == 'true'
+        run: |
+          mkdir -p "$R_LIBS_USER"
+          Rscript -e "install.packages(
+            c('terra', 'sf', 'dplyr'),
+            lib     = '$R_LIBS_USER',
+            repos   = 'https://cloud.r-project.org',
+            quiet   = FALSE)"
+
+      # ── Step 3a: acquire raw anchor TIF for year_start ─────────────────────────
+      - name: Find raw artifact — year_start
+        id: find-raw-start
+        if: steps.check-rasters.outputs.needs_interp == 'true'
+        run: |
+          INFO=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=raw-built-${{ inputs.year_start }}&per_page=5" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last // empty')
+          if [ -n "$INFO" ] && [ "$INFO" != "null" ]; then
+            echo "found=true"                                         >> "$GITHUB_OUTPUT"
+            echo "run_id=$(echo "$INFO" | jq -r '.workflow_run.id')" >> "$GITHUB_OUTPUT"
+            echo "Raw artifact for ${{ inputs.year_start }} found"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No raw artifact for ${{ inputs.year_start }} — will download from JRC"
+          fi
+
+      - name: Download raw artifact — year_start
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-start.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name:         raw-built-${{ inputs.year_start }}
+          path:         raw-data/built_${{ inputs.year_start }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id:       ${{ steps.find-raw-start.outputs.run_id }}
+
+      - name: Download raw data from JRC — year_start
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-start.outputs.found == 'false'
+        run: |
+          bash scripts/download_raw.sh \
+            ${{ inputs.year_start }} \
+            raw-data/built_${{ inputs.year_start }}
+
+      - name: Upload raw artifact — year_start
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-start.outputs.found == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name:           raw-built-${{ inputs.year_start }}
+          path:           raw-data/built_${{ inputs.year_start }}/
+          retention-days: 90
+
+      # ── Step 3b: acquire raw anchor TIF for year_end ───────────────────────────
+      - name: Find raw artifact — year_end
+        id: find-raw-end
+        if: steps.check-rasters.outputs.needs_interp == 'true'
+        run: |
+          INFO=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=raw-built-${{ inputs.year_end }}&per_page=5" \
+            --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last // empty')
+          if [ -n "$INFO" ] && [ "$INFO" != "null" ]; then
+            echo "found=true"                                         >> "$GITHUB_OUTPUT"
+            echo "run_id=$(echo "$INFO" | jq -r '.workflow_run.id')" >> "$GITHUB_OUTPUT"
+            echo "Raw artifact for ${{ inputs.year_end }} found"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No raw artifact for ${{ inputs.year_end }} — will download from JRC"
+          fi
+
+      - name: Download raw artifact — year_end
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-end.outputs.found == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name:         raw-built-${{ inputs.year_end }}
+          path:         raw-data/built_${{ inputs.year_end }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          run-id:       ${{ steps.find-raw-end.outputs.run_id }}
+
+      - name: Download raw data from JRC — year_end
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-end.outputs.found == 'false'
+        run: |
+          bash scripts/download_raw.sh \
+            ${{ inputs.year_end }} \
+            raw-data/built_${{ inputs.year_end }}
+
+      - name: Upload raw artifact — year_end
+        if: >-
+          steps.check-rasters.outputs.needs_interp == 'true' &&
+          steps.find-raw-end.outputs.found == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name:           raw-built-${{ inputs.year_end }}
+          path:           raw-data/built_${{ inputs.year_end }}/
+          retention-days: 90
+
+      # ── Step 4: interpolate missing rasters ────────────────────────────────────
+      - name: Find anchor TIF paths
+        id: tifs
+        if: steps.check-rasters.outputs.needs_interp == 'true'
+        run: |
+          TIF_START=$(find "raw-data/built_${{ inputs.year_start }}" -name "*.tif" | head -1)
+          TIF_END=$(find   "raw-data/built_${{ inputs.year_end }}"   -name "*.tif" | head -1)
+          [ -n "$TIF_START" ] || { echo "ERROR: no TIF in raw-data/built_${{ inputs.year_start }}" >&2; exit 1; }
+          [ -n "$TIF_END"   ] || { echo "ERROR: no TIF in raw-data/built_${{ inputs.year_end }}"   >&2; exit 1; }
+          echo "start=$TIF_START" >> "$GITHUB_OUTPUT"
+          echo "end=$TIF_END"     >> "$GITHUB_OUTPUT"
+          echo "Anchor TIFs: $TIF_START  |  $TIF_END"
+
+      - name: Interpolate missing rasters
+        if: steps.check-rasters.outputs.needs_interp == 'true'
+        run: |
+          mkdir -p data/interpolated-rasters
+          Rscript scripts/01_interpolate.R \
+            "${{ steps.tifs.outputs.start }}" \
+            "${{ steps.tifs.outputs.end }}"   \
+            "${{ inputs.year_start }}"         \
+            "${{ inputs.year_end }}"           \
+            "data/interpolated-rasters"        \
+            ${{ steps.check-rasters.outputs.missing }}
+
+      # Upload one artifact per newly-interpolated year.
+      # Six fixed steps with contains() guards — avoids dynamic artifact API calls.
+      - name: Upload raster artifact — y0
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y0)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y0 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y0 }}.tif
+          retention-days: 90
+
+      - name: Upload raster artifact — y1
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y1)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y1 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y1 }}.tif
+          retention-days: 90
+
+      - name: Upload raster artifact — y2
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y2)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y2 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y2 }}.tif
+          retention-days: 90
+
+      - name: Upload raster artifact — y3
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y3)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y3 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y3 }}.tif
+          retention-days: 90
+
+      - name: Upload raster artifact — y4
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y4)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y4 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y4 }}.tif
+          retention-days: 90
+
+      - name: Upload raster artifact — y5
+        if: contains(steps.check-rasters.outputs.missing, steps.years.outputs.y5)
+        uses: actions/upload-artifact@v4
+        with:
+          name:           interpolated-rasters-${{ steps.years.outputs.y5 }}
+          path:           data/interpolated-rasters/built_${{ steps.years.outputs.y5 }}.tif
+          retention-days: 90
+
+      # ── Step 4 (continued): download pre-existing raster artifacts ─────────────
+      # For years that are missing CSVs but already have raster artifacts,
+      # pull the TIF onto disk so extraction can proceed.
+      - name: Download existing raster artifacts
+        if: steps.check-csvs.outputs.has_missing == 'true'
+        run: |
+          mkdir -p data/interpolated-rasters
+          NEED_INTERP=" ${{ steps.check-rasters.outputs.missing }} "
+
+          for yr in ${{ steps.check-csvs.outputs.missing }}; do
+            # Skip years just interpolated — TIF already on disk
+            if echo "$NEED_INTERP" | grep -q " ${yr} "; then
+              echo "[skip] ${yr} — already on disk from interpolation"
+              continue
+            fi
+
+            INFO=$(gh api \
+              "repos/${GITHUB_REPOSITORY}/actions/artifacts?name=interpolated-rasters-${yr}&per_page=5" \
+              --jq '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last // empty')
+
+            if [ -z "$INFO" ] || [ "$INFO" = "null" ]; then
+              echo "ERROR: no valid artifact for interpolated-rasters-${yr}" >&2
+              exit 1
+            fi
+
+            RUN_ID=$(echo "$INFO" | jq -r '.workflow_run.id')
+            gh run download "$RUN_ID" \
+              --name "interpolated-rasters-${yr}" \
+              --dir  "data/interpolated-rasters"
+            echo "[downloaded] interpolated-rasters-${yr}"
+          done
+
+      # ── Step 5: ADM2 boundaries ────────────────────────────────────────────────
+      - name: Ensure ADM2 boundaries present
+        if: steps.check-csvs.outputs.has_missing == 'true'
+        run: |
+          GEOJSON="raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson"
+          if [ ! -f "$GEOJSON" ]; then
+            mkdir -p raw-data/boundaries
+            echo "Downloading ADM2 boundaries ..."
+            curl -fsSL --retry 3 --retry-delay 10 -L \
+              -o "$GEOJSON" \
+              "https://github.com/wmgeolab/geoBoundaries/raw/main/releaseData/CGAZ/geoBoundariesCGAZ_ADM2.geojson"
+          fi
+
+      # ── Step 5 (continued): extract + commit one CSV per missing year ──────────
+      # Six fixed extract→commit pairs, each guarded by contains().
+      # CSVs are committed immediately — a mid-run timeout leaves repo in valid state.
+
+      - name: Extract ADM2 — y0
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y0)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y0 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y0 }}_by_adm2.csv"
+
+      - name: Commit CSV — y0
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y0)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y0 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y0 }}"
+          git pull --rebase
+          git push
+
+      - name: Extract ADM2 — y1
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y1)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y1 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y1 }}_by_adm2.csv"
+
+      - name: Commit CSV — y1
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y1)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y1 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y1 }}"
+          git pull --rebase
+          git push
+
+      - name: Extract ADM2 — y2
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y2)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y2 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y2 }}_by_adm2.csv"
+
+      - name: Commit CSV — y2
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y2)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y2 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y2 }}"
+          git pull --rebase
+          git push
+
+      - name: Extract ADM2 — y3
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y3)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y3 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y3 }}_by_adm2.csv"
+
+      - name: Commit CSV — y3
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y3)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y3 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y3 }}"
+          git pull --rebase
+          git push
+
+      - name: Extract ADM2 — y4
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y4)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y4 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y4 }}_by_adm2.csv"
+
+      - name: Commit CSV — y4
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y4)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y4 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y4 }}"
+          git pull --rebase
+          git push
+
+      - name: Extract ADM2 — y5
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y5)
+        run: |
+          mkdir -p data/built_by_adm2
+          Rscript scripts/02_extract_adm2.R \
+            "data/interpolated-rasters/built_${{ steps.years.outputs.y5 }}.tif" \
+            "raw-data/boundaries/geoBoundariesCGAZ_ADM2.geojson" \
+            "data/built_by_adm2/built_${{ steps.years.outputs.y5 }}_by_adm2.csv"
+
+      - name: Commit CSV — y5
+        if: contains(steps.check-csvs.outputs.missing, steps.years.outputs.y5)
+        run: |
+          git add data/built_by_adm2/built_${{ steps.years.outputs.y5 }}_by_adm2.csv
+          git commit -m "data: add built_by_adm2 for ${{ steps.years.outputs.y5 }}"
+          git pull --rebase
+          git push
+
+      # ── Cleanup ────────────────────────────────────────────────────────────────
+      - name: Cleanup large working files
+        if: always()
+        run: rm -rf raw-data/boundaries raw-data/built_*
