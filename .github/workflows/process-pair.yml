@@ -311,7 +311,7 @@ jobs:
           if [ ! -f "$GEOJSON" ]; then
             mkdir -p raw-data/boundaries
             echo "Downloading ADM2 boundaries ..."
-            curl -fsSL --retry 3 --retry-delay 10 -L \
+            curl -fsSL --http1.1 --retry 3 --retry-delay 10 -L \
               -o "$GEOJSON" \
               "https://github.com/wmgeolab/geoBoundaries/raw/main/releaseData/CGAZ/geoBoundariesCGAZ_ADM2.geojson"
           fi
